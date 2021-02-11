@@ -1,4 +1,5 @@
 mod datasource {
+    pub mod lazy_mem_table;
     pub mod mongodb;
 }
 mod bson_ext;
@@ -14,7 +15,7 @@ use datafusion::execution::context::ExecutionContext;
 use rustyline::{error::ReadlineError, Editor};
 use structopt::StructOpt;
 
-use crate::datasource::mongodb::MongoDbCollection;
+use crate::datasource::{lazy_mem_table::LazyMemTable, mongodb::MongoDbCollection};
 
 #[derive(StructOpt, Debug)]
 pub struct Opts {
@@ -49,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_owned();
         let collection = database.collection(&name);
         let table = MongoDbCollection::new(collection, schema);
+        let table = LazyMemTable::new(table);
         context.register_table(&name, Box::new(table));
     }
 
