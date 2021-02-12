@@ -1,5 +1,6 @@
 use std::iter::Peekable;
 
+use chrono::{offset::Utc, DateTime};
 use mongodb::bson::{
     document::{ValueAccessError, ValueAccessResult},
     Bson, Document,
@@ -36,23 +37,6 @@ pub trait BsonGetNested {
         }
     }
 
-    // fn get_nested_timestamp(&self, key: &str) -> ValueAccessResult<Timestamp> {
-    //     match self.get_nested(key)? {
-    //         &Bson::Timestamp(v) => Ok(v),
-    //         _ => Err(ValueAccessError::UnexpectedType),
-    //     }
-    // }
-
-    // fn get_nested_binary_generic(&self, key: &str) -> ValueAccessResult<&Vec<u8>> {
-    //     match self.get_nested(key)? {
-    //         &Bson::Binary(Binary {
-    //             subtype: BinarySubtype::Generic,
-    //             ref bytes,
-    //         }) => Ok(bytes),
-    //         _ => Err(ValueAccessError::UnexpectedType),
-    //     }
-    // }
-
     fn get_nested_str(&self, key: &str) -> ValueAccessResult<&str> {
         match self.get_nested(key)? {
             &Bson::String(ref v) => Ok(v),
@@ -60,19 +44,12 @@ pub trait BsonGetNested {
         }
     }
 
-    // fn get_nested_decimal128(&self, key: &str) -> ValueAccessResult<&Decimal128> {
-    //     match self.get_nested(key)? {
-    //         &Bson::Decimal128(ref v) => Ok(v),
-    //         _ => Err(ValueAccessError::UnexpectedType),
-    //     }
-    // }
-
-    // fn get_nested_datetime(&self, key: &str) -> ValueAccessResult<&DateTime<Utc>> {
-    //     match self.get_nested(key)? {
-    //         &Bson::DateTime(ref v) => Ok(v),
-    //         _ => Err(ValueAccessError::UnexpectedType),
-    //     }
-    // }
+    fn get_nested_datetime(&self, key: &str) -> ValueAccessResult<&DateTime<Utc>> {
+        match self.get_nested(key)? {
+            &Bson::DateTime(ref v) => Ok(v),
+            _ => Err(ValueAccessError::UnexpectedType),
+        }
+    }
 }
 
 impl BsonGetNested for Document {

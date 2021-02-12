@@ -4,9 +4,10 @@ use std::{collections::HashMap, ops::Deref};
 
 use arrow::{
     array::{
-        BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
+        BooleanBuilder, Date64Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+        StructBuilder,
     },
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, DateUnit, Field, Schema},
     error::{ArrowError, Result},
     record_batch::RecordBatch,
 };
@@ -130,6 +131,22 @@ impl DocumentsReader<'_> {
                             }
                             Ok(Bson::Null) => field_builder.append_null().expect(INFALLIBLE),
                             Ok(_) => return arrow_error(ValueAccessError::UnexpectedType),
+                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                                field_builder.append_null().expect(INFALLIBLE)
+                            }
+                            Err(e) => return arrow_error(e),
+                        };
+                    }
+                }
+                DataType::Date64(DateUnit::Millisecond) => {
+                    let field_builder = builder
+                        .field_builder::<Date64Builder>(i)
+                        .expect("field index out of range");
+                    for doc in self.documents.iter() {
+                        match doc.get_nested_datetime(field.mongodb_field()) {
+                            Ok(val) => field_builder
+                                .append_value(val.timestamp_millis())
+                                .expect(INFALLIBLE),
                             Err(ValueAccessError::NotPresent) if field.is_nullable() => {
                                 field_builder.append_null().expect(INFALLIBLE)
                             }
