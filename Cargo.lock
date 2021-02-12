@@ -177,6 +177,7 @@ dependencies = [
  "futures",
  "lazy-datafusion",
  "mongodb",
+ "mongodb-arrow",
  "mongodb-datafusion",
  "pin-project 1.0.5",
  "rustyline",

@@ -7,6 +7,7 @@ use std::{
 use arrow::{datatypes::Schema, record_batch::RecordBatch};
 use datafusion::execution::context::ExecutionContext;
 use lazy_datafusion::LazyMemTable;
+use mongodb_arrow::{MappedField, MappedSchema};
 use mongodb_datafusion::datasource::MongoDbCollection;
 use rustyline::{error::ReadlineError, Editor};
 use structopt::StructOpt;
@@ -37,11 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for entry in opts.schema.read_dir()? {
         let path = entry?.path();
         let schema = read_schema(&path)?;
-        let name = path
-            .file_stem()
-            .and_then(|e| e.to_str())
-            .unwrap()
-            .to_owned();
+        let name = schema.mongodb_collection().to_owned();
         let collection = database.collection(&name);
         let table = MongoDbCollection::new(collection, schema);
         let table = LazyMemTable::new(table);
@@ -80,7 +77,7 @@ async fn query(
     Ok(context.sql(sql)?.collect().await?)
 }
 
-fn read_schema<P: AsRef<Path>>(path: P) -> Result<Schema, Box<dyn std::error::Error>> {
+fn read_schema<P: AsRef<Path>>(path: P) -> Result<MappedSchema, Box<dyn std::error::Error>> {
     let file = File::open(path.as_ref())?;
     let buf_reader = BufReader::new(file);
 
@@ -91,5 +88,28 @@ fn read_schema<P: AsRef<Path>>(path: P) -> Result<Schema, Box<dyn std::error::Er
 
     // [TODO] error if schema uses any type we don't support
 
-    Ok(schema)
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let mut field = f.clone();
+            let mongodb_field = field
+                .metadata()
+                .as_ref()
+                .and_then(|m| m.get("mongodb"))
+                .unwrap_or_else(|| field.name())
+                .to_owned();
+            field.set_metadata(None);
+            MappedField::new(mongodb_field, field)
+        })
+        .collect();
+
+    let mongodb_collection = path
+        .as_ref()
+        .file_stem()
+        .and_then(|e| e.to_str())
+        .unwrap()
+        .to_owned();
+
+    Ok(MappedSchema::new(mongodb_collection, fields))
 }

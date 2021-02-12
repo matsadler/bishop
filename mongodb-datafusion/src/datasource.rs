@@ -6,11 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use arrow::{
-    datatypes::{Field, Schema, SchemaRef},
-    error::Result as ArrowResult,
-    record_batch::RecordBatch,
-};
+use arrow::{datatypes::SchemaRef, error::Result as ArrowResult, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::{
     datasource::{datasource::Statistics, TableProvider},
@@ -24,19 +20,21 @@ use mongodb::{
     options::FindOptions,
     Collection, Cursor,
 };
-use mongodb_arrow::{mongodb_name, DocumentsReader};
+use mongodb_arrow::{DocumentsReader, MappedField, MappedSchema};
 use tokio::sync::Mutex as TokioMutex;
 
 pub struct MongoDbCollection {
     collection: Collection,
+    mapped_schema: MappedSchema,
     schema: SchemaRef,
 }
 
 impl MongoDbCollection {
-    pub fn new(collection: Collection, schema: Schema) -> Self {
+    pub fn new(collection: Collection, mapped_schema: MappedSchema) -> Self {
         Self {
             collection,
-            schema: Arc::new(schema),
+            mapped_schema: mapped_schema.clone(),
+            schema: Arc::new(mapped_schema.into()),
         }
     }
 }
@@ -56,13 +54,13 @@ impl TableProvider for MongoDbCollection {
         batch_size: usize,
         _filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = match projection {
+        let mapped_schema = match projection {
             Some(columns) => {
-                let projected_columns: Result<Vec<Field>> = columns
+                let projected_columns: Result<Vec<MappedField>> = columns
                     .iter()
                     .map(|i| {
-                        if *i < self.schema.fields().len() {
-                            Ok(self.schema.field(*i).clone())
+                        if *i < self.mapped_schema.fields().len() {
+                            Ok(self.mapped_schema.field(*i).clone())
                         } else {
                             Err(DataFusionError::Internal(
                                 "Projection index out of range".to_string(),
@@ -70,14 +68,19 @@ impl TableProvider for MongoDbCollection {
                         }
                     })
                     .collect();
-                Arc::new(Schema::new(projected_columns?))
+                MappedSchema::new_with_metadata(
+                    self.mapped_schema.mongodb_collection().to_owned(),
+                    projected_columns?,
+                    self.mapped_schema.metadata().clone(),
+                )
             }
-            None => self.schema.clone(),
+            None => self.mapped_schema.clone(),
         };
 
         Ok(Arc::new(MongoExec {
             collection: self.collection.clone(),
-            schema,
+            mapped_schema: Arc::new(mapped_schema.clone()),
+            schema: Arc::new(mapped_schema.into()),
             batch_size,
         }))
     }
@@ -90,6 +93,7 @@ impl TableProvider for MongoDbCollection {
 #[derive(Debug)]
 struct MongoExec {
     collection: Collection,
+    mapped_schema: Arc<MappedSchema>,
     schema: SchemaRef,
     batch_size: usize,
 }
@@ -122,7 +126,7 @@ impl ExecutionPlan for MongoExec {
     async fn execute(&self, _partition: usize) -> Result<SendableRecordBatchStream> {
         let filter = None;
         let options = FindOptions::builder()
-            .projection(Some(mongodb_projection(self.schema.clone())))
+            .projection(Some(mongodb_projection(self.mapped_schema.clone())))
             .batch_size(Some(self.batch_size as u32))
             .build();
         Ok(Box::pin(MongoStream {
@@ -133,6 +137,7 @@ impl ExecutionPlan for MongoExec {
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
                     .fuse(),
             ),
+            mapped_schema: self.mapped_schema.clone(),
             schema: self.schema.clone(),
             batch_size: self.batch_size,
         }))
@@ -141,6 +146,7 @@ impl ExecutionPlan for MongoExec {
 
 struct MongoStream {
     cursor: TokioMutex<Fuse<Cursor>>,
+    mapped_schema: Arc<MappedSchema>,
     schema: SchemaRef,
     batch_size: usize,
 }
@@ -164,7 +170,8 @@ impl Stream for MongoStream {
                 Poll::Pending if documents.is_empty() => break Poll::Pending,
                 Poll::Pending => {
                     break Poll::Ready(Some(
-                        DocumentsReader::new(documents, self.schema.clone()).into_record_batch(),
+                        DocumentsReader::new(documents, self.mapped_schema.fields())
+                            .into_record_batch(),
                     ));
                 }
                 Poll::Ready(Some(Ok(val))) => documents.push(val),
@@ -178,7 +185,8 @@ impl Stream for MongoStream {
                 }
                 Poll::Ready(None) => {
                     break Poll::Ready(Some(
-                        DocumentsReader::new(documents, self.schema.clone()).into_record_batch(),
+                        DocumentsReader::new(documents, self.mapped_schema.fields())
+                            .into_record_batch(),
                     ));
                 }
             }
@@ -192,12 +200,11 @@ impl RecordBatchStream for MongoStream {
     }
 }
 
-fn mongodb_projection(schema: SchemaRef) -> Document {
+fn mongodb_projection(schema: Arc<MappedSchema>) -> Document {
     let mut projection: Document = schema
         .fields()
         .iter()
-        .map(mongodb_name)
-        .map(|f| (f.to_owned(), Bson::Int32(1)))
+        .map(|f| (f.mongodb_field().to_owned(), Bson::Int32(1)))
         .collect();
     // _id defaults to 1, rather than 0 like everything else, so if it's not
     // present we need to explicitly set it to 0
