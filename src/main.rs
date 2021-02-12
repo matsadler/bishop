@@ -1,9 +1,3 @@
-mod datasource {
-    pub mod lazy_mem_table;
-    pub mod mongodb;
-}
-mod bson_ext;
-
 use std::{
     fs::File,
     io::BufReader,
@@ -12,10 +6,10 @@ use std::{
 
 use arrow::{datatypes::Schema, record_batch::RecordBatch};
 use datafusion::execution::context::ExecutionContext;
+use lazy_datafusion::LazyMemTable;
+use mongodb_datafusion::datasource::MongoDbCollection;
 use rustyline::{error::ReadlineError, Editor};
 use structopt::StructOpt;
-
-use crate::datasource::{lazy_mem_table::LazyMemTable, mongodb::MongoDbCollection};
 
 #[derive(StructOpt, Debug)]
 pub struct Opts {

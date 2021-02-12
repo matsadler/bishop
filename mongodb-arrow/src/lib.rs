@@ -1,16 +1,16 @@
+mod bson_ext;
+
 use arrow::{
     array::{
         BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
     },
-    datatypes::{DataType, SchemaRef},
+    datatypes::{DataType, Field, SchemaRef},
     error::{ArrowError, Result},
     record_batch::RecordBatch,
 };
 use mongodb::bson::{document::ValueAccessError, Bson, Document};
 
 use crate::bson_ext::BsonGetNested;
-
-use super::mongodb_name;
 
 pub struct DocumentsReader {
     documents: Vec<Document>,
@@ -122,6 +122,14 @@ impl DocumentsReader {
 
         Ok(RecordBatch::from(&builder.finish()))
     }
+}
+
+pub fn mongodb_name(field: &Field) -> &str {
+    field
+        .metadata()
+        .as_ref()
+        .and_then(|m| m.get("mongodb"))
+        .unwrap_or_else(|| field.name())
 }
 
 #[inline]

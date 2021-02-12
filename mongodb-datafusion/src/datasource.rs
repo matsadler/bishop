@@ -1,5 +1,3 @@
-mod reader;
-
 use std::{
     any::Any,
     future::Future,
@@ -26,9 +24,8 @@ use mongodb::{
     options::FindOptions,
     Collection, Cursor,
 };
+use mongodb_arrow::{mongodb_name, DocumentsReader};
 use tokio::sync::Mutex as TokioMutex;
-
-use reader::DocumentsReader;
 
 pub struct MongoDbCollection {
     collection: Collection,
@@ -206,12 +203,4 @@ fn mongodb_projection(schema: SchemaRef) -> Document {
     // present we need to explicitly set it to 0
     projection.entry("_id".to_owned()).or_insert(Bson::Int32(0));
     projection
-}
-
-fn mongodb_name(field: &Field) -> &str {
-    field
-        .metadata()
-        .as_ref()
-        .and_then(|m| m.get("mongodb"))
-        .unwrap_or_else(|| field.name())
 }
