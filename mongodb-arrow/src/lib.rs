@@ -4,8 +4,8 @@ use std::{collections::HashMap, ops::Deref};
 
 use arrow::{
     array::{
-        BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
-        TimestampNanosecondBuilder,
+        ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+        StructBuilder, TimestampNanosecondBuilder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
     error::{ArrowError, Result},
@@ -39,6 +39,12 @@ impl Deref for MappedField {
 
     fn deref(&self) -> &Self::Target {
         &self.field
+    }
+}
+
+impl From<MappedField> for Field {
+    fn from(val: MappedField) -> Self {
+        val.field
     }
 }
 
@@ -92,9 +98,21 @@ impl From<MappedSchema> for Schema {
     }
 }
 
-pub struct DocumentsReader<'a> {
-    documents: Vec<Document>,
-    fields: &'a Vec<MappedField>,
+trait FromMongodb: ArrayBuilder + Sized {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self>;
+
+    fn from_mongodb_boxed(
+        field: &MappedField,
+        documents: &[Document],
+    ) -> Result<Box<dyn ArrayBuilder>> {
+        Ok(Box::new(Self::from_mongodb(field, documents)?))
+    }
+}
+
+macro_rules! ae {
+    ($e:expr) => {
+        return Err(ArrowError::from_external_error(Box::new($e)))
+    };
 }
 
 // Error message to use with Result::expect() for the various Arrow builder
@@ -104,128 +122,145 @@ pub struct DocumentsReader<'a> {
 // message it's a bug and proper error handling needs to be implemented.
 static INFALLIBLE: &str = "builder result expected to always be Ok(())";
 
-impl DocumentsReader<'_> {
-    pub fn new(documents: Vec<Document>, fields: &Vec<MappedField>) -> DocumentsReader {
+impl FromMongodb for StringBuilder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested(field.mongodb_field()) {
+                Ok(Bson::ObjectId(oid)) => {
+                    builder.append_value(&oid.to_string()).expect(INFALLIBLE)
+                }
+                Ok(Bson::String(val)) | Ok(Bson::Symbol(val)) => {
+                    builder.append_value(&val).expect(INFALLIBLE)
+                }
+                Ok(Bson::Null) => builder.append_null().expect(INFALLIBLE),
+                Ok(_) => ae!(ValueAccessError::UnexpectedType),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+impl FromMongodb for TimestampNanosecondBuilder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested_datetime(field.mongodb_field()) {
+                Ok(val) => builder
+                    .append_value(val.timestamp_nanos())
+                    .expect(INFALLIBLE),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+impl FromMongodb for Int32Builder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested_i32(field.mongodb_field()) {
+                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+impl FromMongodb for Int64Builder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested_i64(field.mongodb_field()) {
+                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+impl FromMongodb for Float64Builder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested_f64(field.mongodb_field()) {
+                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+impl FromMongodb for BooleanBuilder {
+    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
+        let mut builder = Self::new(documents.len());
+        for doc in documents {
+            match doc.get_nested_bool(field.mongodb_field()) {
+                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
+                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
+                    builder.append_null().expect(INFALLIBLE)
+                }
+                Err(e) => ae!(e),
+            };
+        }
+        Ok(builder)
+    }
+}
+
+pub struct DocumentsReader {
+    documents: Vec<Document>,
+    fields: Vec<MappedField>,
+}
+
+impl DocumentsReader {
+    pub fn new(documents: Vec<Document>, fields: Vec<MappedField>) -> DocumentsReader {
         DocumentsReader { documents, fields }
     }
 
     pub fn into_record_batch(self) -> Result<RecordBatch> {
-        let mut builder = StructBuilder::from_fields(
-            self.fields.iter().map(|f| f.field.clone()).collect(),
-            self.documents.len(),
-        );
-
-        for (i, field) in self.fields.into_iter().enumerate() {
-            match field.data_type() {
-                DataType::Utf8 => {
-                    let field_builder = builder
-                        .field_builder::<StringBuilder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested(field.mongodb_field()) {
-                            Ok(Bson::ObjectId(oid)) => field_builder
-                                .append_value(&oid.to_string())
-                                .expect(INFALLIBLE),
-                            Ok(Bson::String(val)) | Ok(Bson::Symbol(val)) => {
-                                field_builder.append_value(&val).expect(INFALLIBLE)
-                            }
-                            Ok(Bson::Null) => field_builder.append_null().expect(INFALLIBLE),
-                            Ok(_) => return arrow_error(ValueAccessError::UnexpectedType),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
-                }
+        let builders = self
+            .fields
+            .iter()
+            .map(|field| match field.data_type() {
+                DataType::Utf8 => StringBuilder::from_mongodb_boxed(field, &self.documents),
                 DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    let field_builder = builder
-                        .field_builder::<TimestampNanosecondBuilder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested_datetime(field.mongodb_field()) {
-                            Ok(val) => field_builder
-                                .append_value(val.timestamp_nanos())
-                                .expect(INFALLIBLE),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
+                    TimestampNanosecondBuilder::from_mongodb_boxed(field, &self.documents)
                 }
-                DataType::Int32 => {
-                    let field_builder = builder
-                        .field_builder::<Int32Builder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested_i32(field.mongodb_field()) {
-                            Ok(val) => field_builder.append_value(val).expect(INFALLIBLE),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
-                }
-                DataType::Int64 => {
-                    let field_builder = builder
-                        .field_builder::<Int64Builder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested_i64(field.mongodb_field()) {
-                            Ok(val) => field_builder.append_value(val).expect(INFALLIBLE),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
-                }
-                DataType::Float64 => {
-                    let field_builder = builder
-                        .field_builder::<Float64Builder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested_f64(field.mongodb_field()) {
-                            Ok(val) => field_builder.append_value(val).expect(INFALLIBLE),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
-                }
-                DataType::Boolean => {
-                    let field_builder = builder
-                        .field_builder::<BooleanBuilder>(i)
-                        .expect("field index out of range");
-                    for doc in self.documents.iter() {
-                        match doc.get_nested_bool(field.mongodb_field()) {
-                            Ok(val) => field_builder.append_value(val).expect(INFALLIBLE),
-                            Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                                field_builder.append_null().expect(INFALLIBLE)
-                            }
-                            Err(e) => return arrow_error(e),
-                        };
-                    }
-                }
-                _ => return arrow_error(ValueAccessError::UnexpectedType),
-            }
-        }
+                DataType::Int32 => Int32Builder::from_mongodb_boxed(field, &self.documents),
+                DataType::Int64 => Int64Builder::from_mongodb_boxed(field, &self.documents),
+                DataType::Float64 => Float64Builder::from_mongodb_boxed(field, &self.documents),
+                DataType::Boolean => BooleanBuilder::from_mongodb_boxed(field, &self.documents),
+                _ => ae!(ValueAccessError::UnexpectedType),
+            })
+            .collect::<Result<_>>()?;
 
-        for _ in 0..self.documents.len() {
+        let mut builder =
+            StructBuilder::new(self.fields.into_iter().map(Into::into).collect(), builders);
+
+        for _ in self.documents {
             builder.append(true).expect(INFALLIBLE);
         }
 
         Ok(RecordBatch::from(&builder.finish()))
     }
-}
-
-#[inline]
-fn arrow_error<T>(e: T) -> Result<RecordBatch>
-where
-    T: std::error::Error + Send + Sync + 'static,
-{
-    Err(ArrowError::from_external_error(Box::new(e)))
 }

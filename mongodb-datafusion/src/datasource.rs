@@ -170,7 +170,7 @@ impl Stream for MongoStream {
                 Poll::Pending if documents.is_empty() => break Poll::Pending,
                 Poll::Pending => {
                     break Poll::Ready(Some(
-                        DocumentsReader::new(documents, self.mapped_schema.fields())
+                        DocumentsReader::new(documents, self.mapped_schema.fields().clone())
                             .into_record_batch(),
                     ));
                 }
@@ -185,7 +185,7 @@ impl Stream for MongoStream {
                 }
                 Poll::Ready(None) => {
                     break Poll::Ready(Some(
-                        DocumentsReader::new(documents, self.mapped_schema.fields())
+                        DocumentsReader::new(documents, self.mapped_schema.fields().clone())
                             .into_record_batch(),
                     ));
                 }
