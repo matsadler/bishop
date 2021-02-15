@@ -5,10 +5,10 @@ use std::{collections::HashMap, ops::Deref};
 use arrow::{
     array::{
         ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-        StructBuilder, TimestampNanosecondBuilder,
+        StructArray, StructBuilder, TimestampNanosecondBuilder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
-    error::{ArrowError, Result},
+    error::ArrowError,
     record_batch::RecordBatch,
 };
 use mongodb::bson::{document::ValueAccessError, Bson, Document};
@@ -68,7 +68,7 @@ impl MappedSchema {
         Self {
             mongodb_collection,
             fields,
-            metadata: metadata,
+            metadata,
         }
     }
 
@@ -98,21 +98,25 @@ impl From<MappedSchema> for Schema {
     }
 }
 
-trait FromMongodb: ArrayBuilder + Sized {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self>;
-
-    fn from_mongodb_boxed(
-        field: &MappedField,
-        documents: &[Document],
-    ) -> Result<Box<dyn ArrayBuilder>> {
-        Ok(Box::new(Self::from_mongodb(field, documents)?))
-    }
+struct FieldInfo {
+    index: usize,
+    mongodb_field: String,
+    is_nullable: bool,
+    builder_type: BuilderType,
 }
 
-macro_rules! ae {
-    ($e:expr) => {
-        return Err(ArrowError::from_external_error(Box::new($e)))
-    };
+enum BuilderType {
+    String,
+    TimestampNanosecond,
+    Int32,
+    Int64,
+    Float64,
+    Boolean,
+}
+
+pub struct DocumentBuilder {
+    builder: StructBuilder,
+    field_info: Vec<FieldInfo>,
 }
 
 // Error message to use with Result::expect() for the various Arrow builder
@@ -122,109 +126,260 @@ macro_rules! ae {
 // message it's a bug and proper error handling needs to be implemented.
 static INFALLIBLE: &str = "builder result expected to always be Ok(())";
 
-impl FromMongodb for StringBuilder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested(field.mongodb_field()) {
-                Ok(Bson::ObjectId(oid)) => {
-                    builder.append_value(&oid.to_string()).expect(INFALLIBLE)
+impl DocumentBuilder {
+    pub fn new(fields: Vec<MappedField>, capacity: usize) -> Result<DocumentBuilder, ArrowError> {
+        let field_info = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let builder_type = match field.data_type() {
+                    DataType::Utf8 => BuilderType::String,
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                        BuilderType::TimestampNanosecond
+                    }
+                    DataType::Int32 => BuilderType::Int32,
+                    DataType::Int64 => BuilderType::Int64,
+                    DataType::Float64 => BuilderType::Float64,
+                    DataType::Boolean => BuilderType::Boolean,
+                    data_type => {
+                        return Err(ArrowError::SchemaError(format!(
+                            "{} not supported in mongodb_arrow::DocumentBuilder",
+                            data_type
+                        )))
+                    }
+                };
+                Ok(FieldInfo {
+                    index,
+                    mongodb_field: field.mongodb_field().to_owned(),
+                    is_nullable: field.is_nullable(),
+                    builder_type,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let builder =
+            StructBuilder::from_fields(fields.into_iter().map(Into::into).collect(), capacity);
+        Ok(DocumentBuilder {
+            builder,
+            field_info,
+        })
+    }
+
+    pub fn append_value(&mut self, doc: Document) -> Result<(), Vec<ArrowError>> {
+        let mut errors = Vec::new();
+
+        for field in self.field_info.iter() {
+            match field.builder_type {
+                BuilderType::String => {
+                    if let Err(e) = handle_string(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
                 }
-                Ok(Bson::String(val)) | Ok(Bson::Symbol(val)) => {
-                    builder.append_value(&val).expect(INFALLIBLE)
+                BuilderType::TimestampNanosecond => {
+                    if let Err(e) = handle_timestamp_nanosecond(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
                 }
-                Ok(Bson::Null) => builder.append_null().expect(INFALLIBLE),
-                Ok(_) => ae!(ValueAccessError::UnexpectedType),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
+                BuilderType::Int32 => {
+                    if let Err(e) = handle_i32(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
                 }
-                Err(e) => ae!(e),
-            };
+                BuilderType::Int64 => {
+                    if let Err(e) = handle_i64(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
+                }
+                BuilderType::Float64 => {
+                    if let Err(e) = handle_float64(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
+                }
+                BuilderType::Boolean => {
+                    if let Err(e) = handle_boolean(&mut self.builder, field, &doc) {
+                        errors.push(e);
+                    }
+                }
+            }
         }
-        Ok(builder)
+        let success = errors.is_empty();
+        self.builder.append(success).expect(INFALLIBLE);
+        if success {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.builder.len()
+    }
+
+    pub fn finish(&mut self) -> StructArray {
+        self.builder.finish()
     }
 }
 
-impl FromMongodb for TimestampNanosecondBuilder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested_datetime(field.mongodb_field()) {
-                Ok(val) => builder
-                    .append_value(val.timestamp_nanos())
-                    .expect(INFALLIBLE),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
-                }
-                Err(e) => ae!(e),
-            };
-        }
-        Ok(builder)
-    }
+macro_rules! ae {
+    ($e:expr) => {
+        return Err(ArrowError::from_external_error(Box::new($e)))
+    };
 }
 
-impl FromMongodb for Int32Builder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested_i32(field.mongodb_field()) {
-                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
-                }
-                Err(e) => ae!(e),
-            };
+static BUILDER_TYPE: &str = "incorrect builder type for field";
+
+fn handle_string(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<StringBuilder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::ObjectId(oid)) => builder.append_value(&oid.to_string()).expect(INFALLIBLE),
+        Ok(Bson::String(val)) | Ok(Bson::Symbol(val)) => {
+            builder.append_value(&val).expect(INFALLIBLE)
         }
-        Ok(builder)
-    }
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
+        }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
 }
 
-impl FromMongodb for Int64Builder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested_i64(field.mongodb_field()) {
-                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
-                }
-                Err(e) => ae!(e),
-            };
+fn handle_timestamp_nanosecond(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<TimestampNanosecondBuilder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::DateTime(val)) => builder
+            .append_value(val.timestamp_nanos())
+            .expect(INFALLIBLE),
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
         }
-        Ok(builder)
-    }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
 }
 
-impl FromMongodb for Float64Builder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested_f64(field.mongodb_field()) {
-                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
-                }
-                Err(e) => ae!(e),
-            };
+fn handle_i32(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<Int32Builder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::Int32(val)) => builder.append_value(*val).expect(INFALLIBLE),
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
         }
-        Ok(builder)
-    }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
 }
 
-impl FromMongodb for BooleanBuilder {
-    fn from_mongodb(field: &MappedField, documents: &[Document]) -> Result<Self> {
-        let mut builder = Self::new(documents.len());
-        for doc in documents {
-            match doc.get_nested_bool(field.mongodb_field()) {
-                Ok(val) => builder.append_value(val).expect(INFALLIBLE),
-                Err(ValueAccessError::NotPresent) if field.is_nullable() => {
-                    builder.append_null().expect(INFALLIBLE)
-                }
-                Err(e) => ae!(e),
-            };
+fn handle_i64(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<Int64Builder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::Int64(val)) => builder.append_value(*val).expect(INFALLIBLE),
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
         }
-        Ok(builder)
-    }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
+}
+
+fn handle_float64(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<Float64Builder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::Double(val)) => builder.append_value(*val).expect(INFALLIBLE),
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
+        }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
+}
+
+fn handle_boolean(
+    builder: &mut StructBuilder,
+    field: &FieldInfo,
+    doc: &Document,
+) -> Result<(), ArrowError> {
+    let builder = builder
+        .field_builder::<BooleanBuilder>(field.index)
+        .expect(BUILDER_TYPE);
+    match doc.get_nested(&field.mongodb_field) {
+        Ok(Bson::Boolean(val)) => builder.append_value(*val).expect(INFALLIBLE),
+        Ok(Bson::Null) | Err(ValueAccessError::NotPresent) if field.is_nullable => {
+            builder.append_null().expect(INFALLIBLE)
+        }
+        Ok(_) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(ValueAccessError::UnexpectedType);
+        }
+        Err(e) => {
+            builder.append_null().expect(INFALLIBLE);
+            ae!(e);
+        }
+    };
+    Ok(())
 }
 
 pub struct DocumentsReader {
@@ -237,30 +392,13 @@ impl DocumentsReader {
         DocumentsReader { documents, fields }
     }
 
-    pub fn into_record_batch(self) -> Result<RecordBatch> {
-        let builders = self
-            .fields
-            .iter()
-            .map(|field| match field.data_type() {
-                DataType::Utf8 => StringBuilder::from_mongodb_boxed(field, &self.documents),
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    TimestampNanosecondBuilder::from_mongodb_boxed(field, &self.documents)
-                }
-                DataType::Int32 => Int32Builder::from_mongodb_boxed(field, &self.documents),
-                DataType::Int64 => Int64Builder::from_mongodb_boxed(field, &self.documents),
-                DataType::Float64 => Float64Builder::from_mongodb_boxed(field, &self.documents),
-                DataType::Boolean => BooleanBuilder::from_mongodb_boxed(field, &self.documents),
-                _ => ae!(ValueAccessError::UnexpectedType),
-            })
-            .collect::<Result<_>>()?;
-
-        let mut builder =
-            StructBuilder::new(self.fields.into_iter().map(Into::into).collect(), builders);
-
-        for _ in self.documents {
-            builder.append(true).expect(INFALLIBLE);
+    pub fn into_record_batch(self) -> Result<RecordBatch, ArrowError> {
+        let mut builder = DocumentBuilder::new(self.fields, self.documents.len())?;
+        for document in self.documents {
+            builder
+                .append_value(document)
+                .map_err(|errors| errors.into_iter().next().expect("empty errors"))?;
         }
-
         Ok(RecordBatch::from(&builder.finish()))
     }
 }
