@@ -6,4 +6,5 @@ edition = "2018"
 
 [dependencies]
 arrow = "3"
+chrono = "0.4"
 mongodb = "1"

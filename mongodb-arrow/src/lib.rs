@@ -1,17 +1,21 @@
 mod bson_ext;
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, convert::TryInto, ops::Deref};
 
 use arrow::{
     array::{
-        ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-        StructArray, StructBuilder, TimestampNanosecondBuilder,
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder, Float64Builder,
+        Int32Builder, Int64Builder, LargeBinaryBuilder, LargeStringBuilder, StringBuilder,
+        StructArray, StructBuilder, Time32MillisecondBuilder, Time32SecondBuilder,
+        Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
     },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    datatypes::{DataType, DateUnit, Field, Schema, TimeUnit},
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use mongodb::bson::{document::ValueAccessError, Bson, Document};
+use chrono::Timelike;
+use mongodb::bson::{document::ValueAccessError, spec::BinarySubtype, Binary, Bson, Document};
 
 use crate::bson_ext::BsonGetNested;
 
@@ -173,9 +177,11 @@ impl DocumentBuilder {
                     Bson::String(val) => &val,
                     Bson::Symbol(val) => &val,
                 }),
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    append_value!(TimestampNanosecondBuilder, self.builder, field, doc, errors {
-                        Bson::DateTime(val) => val.timestamp_nanos(),
+                DataType::LargeUtf8 => {
+                    append_value!(LargeStringBuilder, self.builder, field, doc, errors {
+                        Bson::ObjectId(oid) => &oid.to_string(),
+                        Bson::String(val) => &val,
+                        Bson::Symbol(val) => &val,
                     })
                 }
                 DataType::Int32 => append_value!(Int32Builder, self.builder, field, doc, errors {
@@ -192,6 +198,79 @@ impl DocumentBuilder {
                 DataType::Boolean => {
                     append_value!(BooleanBuilder, self.builder, field, doc, errors {
                         Bson::Boolean(val) => *val,
+                    })
+                }
+                DataType::Timestamp(TimeUnit::Second, _) => {
+                    append_value!(TimestampSecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => val.timestamp(),
+                    })
+                }
+                DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                    append_value!(TimestampMillisecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => val.timestamp_millis(),
+                    })
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    append_value!(TimestampMicrosecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => val.timestamp_nanos() / 1_000,
+                    })
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    append_value!(TimestampNanosecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => val.timestamp_nanos(),
+                    })
+                }
+                DataType::Date32(DateUnit::Day) => {
+                    append_value!(Date32Builder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => (val.timestamp() / 86_400).try_into().expect("days since epoch shouldn't overflow"),
+                    })
+                }
+                DataType::Date64(DateUnit::Millisecond) => {
+                    append_value!(Date64Builder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => (val.timestamp() / 86_400) * 1_000,
+                    })
+                }
+                DataType::Time32(TimeUnit::Second) => {
+                    append_value!(Time32SecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => val.time().num_seconds_from_midnight().try_into().expect("seconds since midnight shouldn't overflow"),
+                    })
+                }
+                DataType::Time32(TimeUnit::Millisecond) => {
+                    append_value!(Time32MillisecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => {
+                            let t = val.time();
+                            ((t.num_seconds_from_midnight() * 1_000) + (t.nanosecond() / 1_000_000)).try_into().expect("milliseconds since midnight shouldn't overflow")
+                        },
+                    })
+                }
+                DataType::Time64(TimeUnit::Microsecond) => {
+                    append_value!(Time64MicrosecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => {
+                            let t = val.time();
+                            ((t.num_seconds_from_midnight() * 1_000_000) + (t.nanosecond() / 1_000)).try_into().expect("microseconds since midnight shouldn't overflow")
+                        },
+                    })
+                }
+                DataType::Time64(TimeUnit::Nanosecond) => {
+                    append_value!(Time64NanosecondBuilder, self.builder, field, doc, errors {
+                        Bson::DateTime(val) => {
+                            let t = val.time();
+                            ((t.num_seconds_from_midnight() * 1_000_000_000) + t.nanosecond()).try_into().expect("nanoseconds since midnight shouldn't overflow")
+                        },
+                    })
+                }
+                DataType::Binary => {
+                    append_value!(BinaryBuilder, self.builder, field, doc, errors {
+                        Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes }) => &bytes,
+                        Bson::Binary(Binary { subtype: BinarySubtype::BinaryOld, bytes }) => &bytes,
+                        Bson::Binary(Binary { subtype: BinarySubtype::UserDefined(_), bytes }) => &bytes,
+                    })
+                }
+                DataType::LargeBinary => {
+                    append_value!(LargeBinaryBuilder, self.builder, field, doc, errors {
+                        Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes }) => &bytes,
+                        Bson::Binary(Binary { subtype: BinarySubtype::BinaryOld, bytes }) => &bytes,
+                        Bson::Binary(Binary { subtype: BinarySubtype::UserDefined(_), bytes }) => &bytes,
                     })
                 }
                 ref data_type => panic!(

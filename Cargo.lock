@@ -1410,6 +1410,7 @@ name = "mongodb-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "chrono",
  "mongodb",
 ]
 
